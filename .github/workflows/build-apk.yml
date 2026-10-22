@@ -1,0 +1,255 @@
+name: Build LingoWorld APK (auto-unzip, multi-strategy)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+          - both
+      zip_name:
+        description: 'Optional: exact zip file name in repo root (auto-detected if empty)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: ${{ github.event.inputs.build_type || 'debug' }}
+  ZIP_NAME: ${{ github.event.inputs.zip_name || '' }}
+
+jobs:
+  build:
+    name: Unzip and build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Find and unzip project
+        run: |
+          set -u
+          ZIP=""
+          if [ -n "${ZIP_NAME:-}" ] && [ -f "$ZIP_NAME" ]; then ZIP="$ZIP_NAME"; fi
+          if [ -z "$ZIP" ]; then ZIP=$(ls -1t lingoworld*.zip 2>/dev/null | head -n 1 || true); fi
+          if [ -z "$ZIP" ]; then ZIP=$(ls -1t ./*.zip 2>/dev/null | head -n 1 || true); fi
+          if [ -z "$ZIP" ]; then ZIP=$(find . -maxdepth 3 -name '*.zip' -not -path './.git/*' | head -n 1 || true); fi
+
+          SRC="$GITHUB_WORKSPACE/_src"
+          rm -rf "$SRC"; mkdir -p "$SRC"
+
+          if [ -n "$ZIP" ]; then
+            echo "Found zip: $ZIP"
+            ok=0
+            unzip -q -o "$ZIP" -d "$SRC" && ok=1
+            if [ $ok -eq 0 ]; then
+              echo "unzip failed, trying python zipfile..."
+              python3 -m zipfile -e "$ZIP" "$SRC" && ok=1
+            fi
+            if [ $ok -eq 0 ]; then
+              echo "python failed, trying jar..."
+              (cd "$SRC" && jar xf "$GITHUB_WORKSPACE/$ZIP") && ok=1
+            fi
+            if [ $ok -eq 0 ]; then
+              echo "::error::Could not extract $ZIP with any method"
+              exit 1
+            fi
+            rm -rf "$SRC/__MACOSX"
+          else
+            echo "No zip found. Looking for an already-extracted project in the repo..."
+            if [ -f settings.gradle.kts ] || [ -f settings.gradle ]; then
+              SRC="$GITHUB_WORKSPACE"
+            else
+              echo "::error::No zip file and no Gradle project found in the repo root."
+              exit 1
+            fi
+          fi
+
+          ROOT=$(find "$SRC" -maxdepth 4 \( -name settings.gradle.kts -o -name settings.gradle \) \
+                   -not -path '*/__MACOSX/*' -not -path '*/.git/*' -printf '%d %h\n' \
+                 | sort -n | head -n 1 | cut -d' ' -f2- || true)
+          if [ -z "$ROOT" ]; then
+            echo "::error::settings.gradle(.kts) not found inside the zip"
+            exit 1
+          fi
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+          ls -la "$ROOT"
+
+      - name: Auto-repair project
+        run: |
+          cd "$PROJECT_DIR"
+
+          if [ ! -f gradle.properties ]; then touch gradle.properties; fi
+          grep -q '^android.useAndroidX' gradle.properties || echo 'android.useAndroidX=true' >> gradle.properties
+          grep -q '^org.gradle.jvmargs' gradle.properties || echo 'org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' >> gradle.properties
+
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            sed -i 's/\r$//' gradlew
+          else
+            echo "::warning::gradlew missing - only the system-Gradle strategies can work"
+          fi
+
+          MANIFEST=$(find . -path '*/src/main/AndroidManifest.xml' | head -n 1 || true)
+          if [ -n "$MANIFEST" ] && grep -q '@mipmap/ic_launcher' "$MANIFEST"; then
+            if [ -z "$(find . -path '*/res/mipmap*' -name 'ic_launcher*' | head -n 1)" ]; then
+              echo "::warning::Launcher icons missing - removing icon references from manifest"
+              sed -i '/android:icon=/d; /android:roundIcon=/d' "$MANIFEST"
+            fi
+          fi
+
+          cat > "$RUNNER_TEMP/ci_build.sh" <<'SH'
+          #!/usr/bin/env bash
+          # usage: ci_build.sh <label> <gradle-executable> [extra gradle args...]
+          set -uo pipefail
+          LABEL="$1"; GRADLE="$2"; shift 2
+          cd "$PROJECT_DIR" || exit 0
+          case "$BUILD_TYPE" in
+            release) TASKS="assembleRelease" ;;
+            both)    TASKS="assembleDebug assembleRelease" ;;
+            *)       TASKS="assembleDebug" ;;
+          esac
+          echo "::group::Strategy $LABEL -> $GRADLE $TASKS $*"
+          $GRADLE $TASKS "$@" 2>&1 | tee "$RUNNER_TEMP/build-$LABEL.log"
+          status=${PIPESTATUS[0]}
+          echo "::endgroup::"
+          if [ "$status" -eq 0 ] && find . -path '*/build/outputs/apk/*' -name '*.apk' | grep -q .; then
+            echo "BUILD_OK=true" >> "$GITHUB_ENV"
+            echo "WINNING_STRATEGY=$LABEL" >> "$GITHUB_ENV"
+            echo "Strategy $LABEL succeeded"
+          else
+            echo "::warning::Strategy $LABEL failed (exit $status) - trying the next one"
+          fi
+          exit 0
+          SH
+          sed -i 's/^          //' "$RUNNER_TEMP/ci_build.sh"
+          chmod +x "$RUNNER_TEMP/ci_build.sh"
+
+      - name: "Strategy 1 - Gradle wrapper (standard)"
+        run: |
+          "$RUNNER_TEMP/ci_build.sh" S1-wrapper ./gradlew --no-daemon --stacktrace
+
+      - name: "Strategy 2 - Wrapper, clean + refresh dependencies"
+        if: env.BUILD_OK != 'true'
+        run: |
+          (cd "$PROJECT_DIR" && rm -rf build app/build .gradle && ./gradlew clean --no-daemon || true)
+          "$RUNNER_TEMP/ci_build.sh" S2-clean-refresh ./gradlew --refresh-dependencies --no-build-cache --no-daemon --stacktrace
+
+      - name: "Strategy 3 - System Gradle 8.7 (ignores a broken wrapper)"
+        if: env.BUILD_OK != 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+          cache-disabled: true
+
+      - name: "Strategy 3 - run"
+        if: env.BUILD_OK != 'true'
+        run: |
+          "$RUNNER_TEMP/ci_build.sh" S3-system-gradle gradle --no-daemon --stacktrace
+
+      - name: "Strategy 4 - JDK 21 toolchain"
+        if: env.BUILD_OK != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: "Strategy 4 - run"
+        if: env.BUILD_OK != 'true'
+        run: |
+          "$RUNNER_TEMP/ci_build.sh" S4-jdk21 ./gradlew --no-daemon --stacktrace --no-build-cache
+
+      - name: "Strategy 5 - Low-memory, non-incremental, single worker"
+        if: env.BUILD_OK != 'true'
+        run: |
+          "$RUNNER_TEMP/ci_build.sh" S5-safe-mode ./gradlew --no-daemon --stacktrace --no-parallel --no-build-cache \
+            -Pkotlin.incremental=false -Pksp.incremental=false -Dorg.gradle.workers.max=2 \
+            "-Dorg.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8"
+
+      - name: "Strategy 6 - System Gradle + safe mode"
+        if: env.BUILD_OK != 'true'
+        run: |
+          "$RUNNER_TEMP/ci_build.sh" S6-system-safe gradle --no-daemon --stacktrace --no-parallel \
+            -Pkotlin.incremental=false -Pksp.incremental=false
+
+      - name: Stop if every strategy failed
+        if: env.BUILD_OK != 'true'
+        run: |
+          echo "::error::All 6 build strategies failed. Open the 'build-logs' artifact or the Job Summary for the real error."
+          exit 1
+
+      - name: Collect APKs
+        if: env.BUILD_OK == 'true'
+        run: |
+          mkdir -p apk_output
+          while IFS= read -r f; do
+            variant=$(basename "$(dirname "$f")")
+            cp "$f" "apk_output/LingoWorld-$variant.apk"
+          done < <(find "$PROJECT_DIR" -path '*/build/outputs/apk/*' -name '*.apk')
+          ls -lh apk_output
+
+      - name: Upload APK
+        if: env.BUILD_OK == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LingoWorld-APK
+          path: apk_output/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: ${{ runner.temp }}/build-*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            if [ "${BUILD_OK:-}" = "true" ]; then
+              echo "### APK ready (strategy: ${WINNING_STRATEGY:-?})"
+              echo ""
+              echo "Download **LingoWorld-APK** from the *Artifacts* section at the bottom of this page."
+              echo ""
+              ls -lh apk_output 2>/dev/null | sed 's/^/    /'
+            else
+              echo "### Build failed - main errors"
+              echo ""
+              for log in "$RUNNER_TEMP"/build-*.log; do
+                [ -f "$log" ] || continue
+                echo "**$(basename "$log")**"
+                echo '```'
+                grep -hE '^e: |error:|FAILURE|What went wrong|Execution failed|Could not resolve' "$log" | head -n 12
+                echo '```'
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
