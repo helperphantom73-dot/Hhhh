@@ -40,12 +40,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # No "cache: gradle" here: the Gradle files are inside the zip (not in the repo yet),
+      # so setup-java would fail looking for them. Caching is done after unzipping instead.
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -150,6 +151,16 @@ jobs:
           sed -i 's/^          //' "$RUNNER_TEMP/ci_build.sh"
           chmod +x "$RUNNER_TEMP/ci_build.sh"
 
+      - name: Cache Gradle (keyed on the zip)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('*.zip') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
       - name: "Strategy 1 - Gradle wrapper (standard)"
         run: |
           "$RUNNER_TEMP/ci_build.sh" S1-wrapper ./gradlew --no-daemon --stacktrace
@@ -174,7 +185,7 @@ jobs:
 
       - name: "Strategy 4 - JDK 21 toolchain"
         if: env.BUILD_OK != 'true'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
